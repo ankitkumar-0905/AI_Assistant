@@ -4,11 +4,11 @@ from pathlib import Path
 import chromadb
 import streamlit as st
 from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from groq import Groq
 
 
 # =========================================================
-# CONFIG
+# CONFIGURATION
 # =========================================================
 
 DATA_FILE = Path("data/support.txt")
@@ -16,11 +16,11 @@ CHROMA_PATH = "chroma_db"
 COLLECTION_NAME = "teckinfo_support"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-LLM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+GROQ_MODEL = "llama-3.1-8b-instant"
 
 
 # =========================================================
-# PAGE
+# STREAMLIT PAGE
 # =========================================================
 
 st.set_page_config(
@@ -29,8 +29,17 @@ st.set_page_config(
     layout="wide"
 )
 
+
+# =========================================================
+# TITLE
+# =========================================================
+
 st.title("🤖 Teckinfo AI Support Assistant")
-st.caption("RAG-based Technical Support Assistant")
+
+st.caption(
+    "RAG-based Technical Support Assistant using "
+    "ChromaDB + Embeddings + Groq LLM"
+)
 
 
 # =========================================================
@@ -39,6 +48,7 @@ st.caption("RAG-based Technical Support Assistant")
 
 @st.cache_resource
 def load_embedding_model():
+
     return SentenceTransformer(EMBEDDING_MODEL)
 
 
@@ -46,32 +56,30 @@ embedding_model = load_embedding_model()
 
 
 # =========================================================
-# LOAD LLM
+# GROQ CLIENT
 # =========================================================
 
 @st.cache_resource
-def load_llm():
+def load_groq_client():
 
-    tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
+    api_key = st.secrets.get("GROQ_API_KEY")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        LLM_MODEL
-    )
+    if not api_key:
+        raise ValueError(
+            "GROQ_API_KEY is not configured in Streamlit Secrets."
+        )
 
-    return tokenizer, model
+    return Groq(api_key=api_key)
 
 
-tokenizer, llm = load_llm()
+groq_client = load_groq_client()
 
 
 # =========================================================
 # CHUNKING
 # =========================================================
 
-def create_chunks(text):
-
-    chunk_size = 200
-    overlap = 40
+def create_chunks(text, chunk_size=200, overlap=40):
 
     words = text.split()
 
@@ -85,15 +93,16 @@ def create_chunks(text):
 
         chunk = " ".join(words[start:end])
 
-        chunks.append(chunk)
+        if chunk.strip():
+            chunks.append(chunk)
 
-        start = end - overlap
+        start += chunk_size - overlap
 
     return chunks
 
 
 # =========================================================
-# CHROMADB
+# LOAD / CREATE CHROMA DATABASE
 # =========================================================
 
 @st.cache_resource
@@ -103,59 +112,58 @@ def load_collection():
         path=CHROMA_PATH
     )
 
+    # Check whether collection already exists
     try:
 
         collection = client.get_collection(
             name=COLLECTION_NAME
         )
 
-        # If database already contains documents,
-        # don't rebuild it.
-        if collection.count() > 0:
+        count = collection.count()
+
+        if count > 0:
             return collection
 
     except Exception:
-
         pass
 
 
     # -----------------------------------------------------
-    # Build database automatically
+    # If collection does not exist, create it
     # -----------------------------------------------------
 
     if not DATA_FILE.exists():
 
-        st.error(
-            "data/support.txt not found."
+        raise FileNotFoundError(
+            f"Support documentation not found: {DATA_FILE}"
         )
-
-        st.stop()
 
 
     with open(
         DATA_FILE,
         "r",
         encoding="utf-8"
-    ) as f:
+    ) as file:
 
-        text = f.read()
-
-
-    chunks = create_chunks(text)
+        text = file.read()
 
 
-    st.info(
-        "Building knowledge base for the first time..."
+    # Create chunks
+    chunks = create_chunks(
+        text,
+        chunk_size=200,
+        overlap=40
     )
 
 
+    # Generate embeddings
     embeddings = embedding_model.encode(
         chunks,
         show_progress_bar=False
     ).tolist()
 
 
-    # Delete old collection if partially created
+    # Delete old collection if present
     try:
 
         client.delete_collection(
@@ -163,15 +171,16 @@ def load_collection():
         )
 
     except Exception:
-
         pass
 
 
+    # Create new collection
     collection = client.create_collection(
         name=COLLECTION_NAME
     )
 
 
+    # Add documents
     ids = [
         f"chunk_{i}"
         for i in range(len(chunks))
@@ -192,13 +201,13 @@ collection = load_collection()
 
 
 # =========================================================
-# RAG FUNCTION
+# RAG ANSWER GENERATION
 # =========================================================
 
 def generate_answer(query):
 
     # -----------------------------------------------------
-    # Embedding
+    # STEP 1: Create query embedding
     # -----------------------------------------------------
 
     query_embedding = embedding_model.encode(
@@ -207,7 +216,7 @@ def generate_answer(query):
 
 
     # -----------------------------------------------------
-    # Retrieval
+    # STEP 2: Retrieve relevant context
     # -----------------------------------------------------
 
     results = collection.query(
@@ -216,36 +225,46 @@ def generate_answer(query):
     )
 
 
+    if not results["documents"]:
+        return (
+            "Information not available in the "
+            "provided documentation."
+        )
+
+
     context = results["documents"][0][0]
 
 
     # -----------------------------------------------------
-    # Prompt
+    # STEP 3: Send context + question to Groq
     # -----------------------------------------------------
 
-    messages = [
+    response = groq_client.chat.completions.create(
 
-        {
-            "role": "system",
+        model=GROQ_MODEL,
 
-            "content": """
+        messages=[
+
+            {
+                "role": "system",
+                "content": """
 You are a technical support assistant for Teckinfo.
 
 Answer the user's question using ONLY the provided context.
 
-Do not use outside knowledge.
-Do not guess.
-
-If the answer is not available in the context, say:
+Rules:
+1. Do not use outside knowledge.
+2. Do not guess.
+3. Give clear and practical technical answers.
+4. If the answer is not available in the context, say exactly:
 
 Information not available in the provided documentation.
 """
-        },
+            },
 
-        {
-            "role": "user",
-
-            "content": f"""
+            {
+                "role": "user",
+                "content": f"""
 Context:
 
 {context}
@@ -254,57 +273,27 @@ Question:
 
 {query}
 """
-        }
+            }
 
-    ]
+        ],
 
+        temperature=0,
 
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
+        max_tokens=150
     )
 
 
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True
-    )
+    # -----------------------------------------------------
+    # STEP 4: Extract answer
+    # -----------------------------------------------------
 
+    answer = response.choices[0].message.content
 
-    outputs = llm.generate(
-
-        **inputs,
-
-        max_new_tokens=120,
-
-        do_sample=False,
-
-        pad_token_id=tokenizer.eos_token_id
-    )
-
-
-    input_length = inputs["input_ids"].shape[1]
-
-
-    generated_tokens = outputs[
-        0,
-        input_length:
-    ]
-
-
-    answer = tokenizer.decode(
-        generated_tokens,
-        skip_special_tokens=True
-    ).strip()
-
-
-    return answer
+    return answer.strip()
 
 
 # =========================================================
-# CHAT HISTORY
+# SESSION STATE
 # =========================================================
 
 if "messages" not in st.session_state:
@@ -312,9 +301,61 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+with st.sidebar:
+
+    st.header("⚙️ System Information")
+
+    st.write(
+        "**Architecture:** RAG"
+    )
+
+    st.write(
+        "**Embedding:** all-MiniLM-L6-v2"
+    )
+
+    st.write(
+        "**Vector Database:** ChromaDB"
+    )
+
+    st.write(
+        "**LLM:** Groq"
+    )
+
+    st.write(
+        f"**Model:** {GROQ_MODEL}"
+    )
+
+    st.write(
+        "**Knowledge Base:** support.txt"
+    )
+
+
+    st.divider()
+
+
+    if st.button(
+        "🗑️ Clear Chat",
+        use_container_width=True
+    ):
+
+        st.session_state.messages = []
+
+        st.rerun()
+
+
+# =========================================================
+# DISPLAY CHAT HISTORY
+# =========================================================
+
 for message in st.session_state.messages:
 
-    with st.chat_message(message["role"]):
+    with st.chat_message(
+        message["role"]
+    ):
 
         st.markdown(
             message["content"]
@@ -322,7 +363,7 @@ for message in st.session_state.messages:
 
 
 # =========================================================
-# CHAT INPUT
+# USER INPUT
 # =========================================================
 
 query = st.chat_input(
@@ -331,6 +372,10 @@ query = st.chat_input(
 
 
 if query:
+
+    # -----------------------------------------------------
+    # Display user message
+    # -----------------------------------------------------
 
     st.session_state.messages.append(
         {
@@ -345,15 +390,36 @@ if query:
         st.markdown(query)
 
 
+    # -----------------------------------------------------
+    # Generate AI answer
+    # -----------------------------------------------------
+
     with st.chat_message("assistant"):
 
-        with st.spinner("Searching knowledge base..."):
+        with st.spinner(
+            "Searching documentation and generating answer..."
+        ):
 
-            answer = generate_answer(query)
+            try:
+
+                answer = generate_answer(
+                    query
+                )
+
+            except Exception as e:
+
+                answer = (
+                    "⚠️ Error while generating answer:\n\n"
+                    f"{str(e)}"
+                )
 
 
         st.markdown(answer)
 
+
+    # -----------------------------------------------------
+    # Save assistant response
+    # -----------------------------------------------------
 
     st.session_state.messages.append(
         {
@@ -361,52 +427,3 @@ if query:
             "content": answer
         }
     )
-
-
-# =========================================================
-# SIDEBAR
-# =========================================================
-
-with st.sidebar:
-
-    st.header("Project Information")
-
-    st.write(
-        "### Architecture"
-    )
-
-    st.write(
-        "User Question → Embedding → ChromaDB → "
-        "Retrieved Context → Qwen LLM → Answer"
-    )
-
-    st.write(
-        "### Models"
-    )
-
-    st.write(
-        f"Embedding: `{EMBEDDING_MODEL}`"
-    )
-
-    st.write(
-        f"LLM: `{LLM_MODEL}`"
-    )
-
-    st.write(
-        "Vector DB: `ChromaDB`"
-    )
-
-    st.write(
-        "Chunk Size: `200 words`"
-    )
-
-    st.write(
-        "Overlap: `40 words`"
-    )
-
-
-    if st.button("Clear Chat"):
-
-        st.session_state.messages = []
-
-        st.rerun()

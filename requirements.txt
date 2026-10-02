@@ -4,3 +4,4 @@ chromadb
 transformers
 torch
 sentencepiece
+groq
