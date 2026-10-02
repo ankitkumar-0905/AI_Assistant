@@ -16,7 +16,7 @@ CHROMA_PATH = "chroma_db"
 COLLECTION_NAME = "teckinfo_support"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 
 # =========================================================
@@ -255,8 +255,10 @@ Answer the user's question using ONLY the provided context.
 Rules:
 1. Do not use outside knowledge.
 2. Do not guess.
-3. Give clear and practical technical answers.
-4. If the answer is not available in the context, say exactly:
+3. Explain the answer clearly and step-by-step when the context contains multiple steps.
+4. Include commands, configuration details, and important notes when they are present in the context.
+5. Keep the answer relevant to the user's question.
+6. If the answer is not available in the context, say:
 
 Information not available in the provided documentation.
 """
@@ -279,7 +281,7 @@ Question:
 
         temperature=0,
 
-        max_tokens=150
+        max_tokens=500
     )
 
 
